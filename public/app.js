@@ -17,6 +17,7 @@ const state = {
   connectMode: false,
   connectFrom: null, // 连线模式中已点击的第一个区域 id
   report: null,
+  resilienceFilter: '', // 通道韧性风险榜的换场筛选（'' = 全部换场）
   counters: { z: 0, e: 0, a: 0, s: 0 },
 };
 
@@ -632,6 +633,7 @@ function renderBlocks() {
 async function runCheck() {
   try {
     state.report = await api('POST', '/api/analyze', state.doc);
+    state.resilienceFilter = '';
     renderReport();
     $('#btnExportJson').disabled = false;
     $('#btnExportMd').disabled = false;
@@ -738,6 +740,168 @@ function optimizationHtml(t) {
     </div>`;
 }
 
+/* ============================================================
+ * 通道韧性
+ * ============================================================ */
+
+/** 有符号秒数差：+12s / −8s / 0s */
+function fmtDelta(v) {
+  if (v == null) return '—';
+  if (v > 0) return `+${v}s`;
+  if (v < 0) return `−${-v}s`;
+  return '0s';
+}
+
+function resilienceStatusText(st) {
+  return statusText(st) || st;
+}
+
+/** 单个受影响演员的变化行：无路可走或改道后的到达、等待变化 */
+function resilienceAffectedHtml(a) {
+  let change;
+  if (a.noPath) {
+    change =
+      `<span class="rs-no-path">⛔ 无路可走</span>（原本 ${a.baselineArriveAt}s 可达，关闭后邻接图中无路线）`;
+  } else {
+    const bits = [];
+    bits.push(`到达 ${a.baselineArriveAt}s → ${a.newArriveAt}s（${a.arriveDelta > 0 ? '<b class="rs-late">' : a.arriveDelta < 0 ? '<b class="rs-early">' : '<b>'}${fmtDelta(a.arriveDelta)}</b>）`);
+    bits.push(`等待 ${a.baselineWaitSeconds}s → ${a.newWaitSeconds}s（${a.waitDelta > 0 ? '<b class="rs-late">' : a.waitDelta < 0 ? '<b class="rs-early">' : '<b>'}${fmtDelta(a.waitDelta)}</b>）`);
+    change = bits.join('；');
+    if (a.routeChanged) {
+      change += `<div class="rs-route">原路线：${a.baselineRoute.map(esc).join(' → ')}<br>改道后：${a.newRoute.map(esc).join(' → ')}</div>`;
+    }
+  }
+  const tag = a.newlyFailed
+    ? '<span class="rs-tag rs-new-fail">新增失败</span>'
+    : a.noPath
+      ? '<span class="rs-tag rs-new-fail">无路</span>'
+      : a.arriveDelta > 0 || a.waitDelta > 0
+        ? '<span class="rs-tag rs-slow">变慢</span>'
+        : '<span class="rs-tag rs-ease">拥堵缓解</span>';
+  return `
+    <div class="rs-affected">
+      <span class="rs-actor">${esc(a.actorName)} ${tag}</span>
+      <span class="rs-change">${change}</span>
+    </div>`;
+}
+
+/** 一条「关闭某通道」风险方案卡片 */
+function resilienceScenarioHtml(sc, opts) {
+  const narrowTag = sc.narrow ? '<span class="rs-edge-tag narrow">窄通道</span>' : '';
+  const transTag =
+    opts && opts.showTransition
+      ? `<span class="rs-trans">第 ${sc.transitionIndex + 1} 场前 · ${esc(sc.fromSceneName)} → ${esc(sc.toSceneName)}</span>`
+      : '';
+  const metrics =
+    `<span class="rs-metric ${sc.addedFailures ? 'bad' : ''}">新增失败 <b>${sc.addedFailures}</b> 人</span>` +
+    `<span class="rs-metric">最晚到达增量 <b>${fmtDelta(sc.maxArriveDelta)}</b></span>` +
+    `<span class="rs-metric">总等待增量 <b class="${sc.totalWaitDelta < 0 ? 'rs-early' : ''}">${fmtDelta(sc.totalWaitDelta)}</b></span>`;
+  return `
+    <div class="rs-scenario ${sc.addedFailures ? 'has-fail' : ''}">
+      <div class="rs-sc-head">
+        <span class="rs-edge">🚧 关闭「${esc(sc.edgeName)}」${narrowTag}（通行 ${sc.seconds}s）</span>
+        ${transTag}
+        <span class="rs-metrics">${metrics}</span>
+      </div>
+      <div class="rs-affected-list">${sc.affected.map(resilienceAffectedHtml).join('')}</div>
+    </div>`;
+}
+
+/** 全局通道韧性摘要 + 可按换场筛选的风险榜 */
+function resilienceSummaryHtml(r) {
+  const rs = r.resilience;
+  if (!rs || !rs.transitionCount) {
+    return `
+    <div class="resilience-box">
+      <div class="rs-head">🛡️ 通道韧性分析</div>
+      <p class="hint">没有包含演员转场的换场，无需做通道关闭模拟。</p>
+    </div>`;
+  }
+
+  const options = [`<option value="">全部换场（${rs.transitionCount} 个）</option>`].concat(
+    r.transitions
+      .filter((t) => t.resilience)
+      .map(
+        (t) =>
+          `<option value="${t.index}"${String(state.resilienceFilter) === String(t.index) ? ' selected' : ''}>` +
+          `第 ${t.index + 1} 场前 · ${esc(t.fromSceneName)} → ${esc(t.toSceneName)}</option>`,
+      ),
+  ).join('');
+
+  const filterIdx = state.resilienceFilter === '' ? null : Number(state.resilienceFilter);
+  const risks = rs.risks.filter((sc) => filterIdx == null || sc.transitionIndex === filterIdx);
+  const zeroCount =
+    filterIdx == null
+      ? rs.scenarioCount - rs.impactScenarioCount
+      : (() => {
+          const t = r.transitions.find((x) => x.index === filterIdx);
+          return t && t.resilience ? t.resilience.zeroImpactCount : 0;
+        })();
+
+  const cards = risks.length
+    ? risks.map((sc) => resilienceScenarioHtml(sc, { showTransition: filterIdx == null })).join('')
+    : '<p class="hint">该换场中关闭任意一条原本可用的通道都不会改变任何演员的转场结果。</p>';
+
+  return `
+  <div class="resilience-box">
+    <div class="rs-head">
+      🛡️ 通道韧性分析
+      <span class="meta">对 ${rs.transitionCount} 个有演员转场的换场，逐条关闭一条原本可用的通道，
+        沿用该换场的区域阻断、窄通道预约规则与当前演员表顺序重新调度，共模拟 ${rs.scenarioCount} 个方案</span>
+    </div>
+    <div class="rs-summary-bar">
+      <span>有影响方案 <b>${filterIdx == null ? rs.impactScenarioCount : risks.length}</b> 个</span>
+      <span>无影响方案 <b>${zeroCount}</b> 个</span>
+      <span class="${rs.totalAddedFailures ? 'rs-late' : ''}">关闭通道新增失败合计 <b>${
+        filterIdx == null
+          ? rs.totalAddedFailures
+          : risks.reduce((s, sc) => s + sc.addedFailures, 0)
+      }</b> 人次</span>
+      <span class="rs-filter">按换场筛选：
+        <select id="resilienceFilter">${options}</select>
+      </span>
+    </div>
+    <p class="hint">风险按「新增失败人次 → 最晚到达增量 → 总等待增量」字典序排列（越靠前越脆弱）；
+      无路可走者计入新增失败，不再计算到达增量。关闭非窄道备用通道若让他人不再等待，等待增量可能为负。</p>
+    <div class="rs-risks">${cards}</div>
+    ${
+      risks.length
+        ? `<details class="rs-zero"><summary>其余 ${zeroCount} 个方案：关闭后所有演员路线、到达与等待均无变化</summary></details>`
+        : ''
+    }
+  </div>`;
+}
+
+/** 换场卡片内嵌的韧性小节（仅列该换场的风险方案，无影响数量折叠提示） */
+function transitionResilienceHtml(t) {
+  const x = t.resilience;
+  if (!x) return '';
+  if (!x.scenarios.length) {
+    return `
+    <div class="resilience-inline">
+      <div class="rs-inline-head">🛡️ 通道韧性：模拟关闭 ${x.edgeCount} 条原本可用的通道，均无影响</div>
+    </div>`;
+  }
+  return `
+  <div class="resilience-inline">
+    <div class="rs-inline-head">
+      🛡️ 通道韧性：模拟关闭 ${x.edgeCount} 条原本可用的通道，${x.scenarios.length} 条有影响、${x.zeroImpactCount} 条无影响
+      <span class="meta">风险按新增失败人次 → 最晚到达增量 → 总等待增量字典序</span>
+    </div>
+    ${x.scenarios.map((sc) => resilienceScenarioHtml(sc, { showTransition: false })).join('')}
+    <details class="rs-zero"><summary>其余 ${x.zeroImpactCount} 条通道关闭后无影响</summary></details>
+  </div>`;
+}
+
+function bindResilienceFilter() {
+  const sel = $('#resilienceFilter');
+  if (!sel || !sel.addEventListener) return;
+  sel.addEventListener('change', (ev) => {
+    state.resilienceFilter = ev.target.value;
+    renderReport();
+  });
+}
+
 function renderReport() {
   const r = state.report;
   const box = $('#checkResult');
@@ -794,6 +958,8 @@ function renderReport() {
         .join('')}</ul></div>`;
     }
 
+    html += resilienceSummaryHtml(r);
+
     const firstBadIdx = r.transitions.findIndex((x) => !x.possible);
     for (const [ti, t] of r.transitions.entries()) {
       const isFirst = r.firstImpossible && ti === firstBadIdx;
@@ -843,11 +1009,13 @@ function renderReport() {
         </div>`;
       }
       html += optimizationHtml(t);
+      html += transitionResilienceHtml(t);
       html += '</div>';
     }
   }
 
   box.innerHTML = html;
+  bindResilienceFilter();
 }
 
 /* ---------------- 导出 ---------------- */
@@ -927,6 +1095,47 @@ function exportMarkdown() {
     L.push('');
   }
 
+  if (r.resilience && r.resilience.transitionCount) {
+    const rs = r.resilience;
+    L.push('## 通道韧性分析（逐条关闭通道模拟）');
+    L.push('');
+    L.push(
+      `> 对 ${rs.transitionCount} 个有演员转场的换场，逐条模拟关闭一条原本可用的邻接通道，` +
+        `沿用该换场的不可穿越区域、窄通道预约规则与当前演员表顺序重新调度，共 ${rs.scenarioCount} 个方案；` +
+        `其中 ${rs.impactScenarioCount} 个方案产生影响、${rs.scenarioCount - rs.impactScenarioCount} 个无影响，` +
+        `关闭通道新增失败合计 ${rs.totalAddedFailures} 人次。`,
+    );
+    L.push('> 风险按「新增失败人次 → 最晚到达增量 → 总等待增量」字典序排列（越靠前越脆弱）。');
+    L.push('');
+    if (rs.risks.length) {
+      L.push('### 风险榜（跨换场，按字典序）');
+      L.push('');
+      L.push('| # | 换场 | 关闭的通道 | 新增失败 | 最晚到达增量 | 总等待增量 | 受影响演员 |');
+      L.push('| --- | --- | --- | --- | --- | --- | --- |');
+      rs.risks.forEach((sc, k) => {
+        const affected = sc.affected
+          .map((a) =>
+            a.noPath
+              ? `${a.actorName}：无路可走（原 ${a.baselineArriveAt}s 可达）`
+              : `${a.actorName}：${a.baselineArriveAt}s→${a.newArriveAt}s（${fmtDelta(a.arriveDelta)}），等待 ${a.baselineWaitSeconds}s→${a.newWaitSeconds}s（${fmtDelta(a.waitDelta)}）${a.routeChanged ? '，改道' : ''}`,
+          )
+          .join('；');
+        L.push(
+          `| ${k + 1} | 第 ${sc.transitionIndex + 1} 场前 ${sc.fromSceneName} → ${sc.toSceneName} | ` +
+            `${sc.edgeName}${sc.narrow ? '（窄通道）' : ''} | ${sc.addedFailures} 人 | ${fmtDelta(sc.maxArriveDelta)} | ${fmtDelta(sc.totalWaitDelta)} | ${affected.replace(/\|/g, '\\|')} |`,
+        );
+      });
+      L.push('');
+      L.push(
+        `其余 ${rs.scenarioCount - rs.impactScenarioCount} 个方案关闭后所有演员的路线、到达与等待均无变化（明细见各换场小节）。`,
+      );
+      L.push('');
+    } else {
+      L.push('全部方案关闭后均无影响：任意一条原本可用的通道被关闭，都不会改变任何演员的转场结果。');
+      L.push('');
+    }
+  }
+
   L.push('## 逐场转场明细');
   L.push('');
   L.push('> 每次转场按演员表顺序规划：普通边可同时通行；窄通道占用时段内他人不得进入，后续演员可在区域等待或绕路，取计入等待后最早到达的路线。');
@@ -1003,6 +1212,50 @@ function exportMarkdown() {
         );
       }
       L.push('');
+    }
+
+    if (t.resilience) {
+      const x = t.resilience;
+      L.push(`#### 通道韧性（${x.edgeCount} 条原本可用通道逐条关闭，沿用本换场阻断 / 窄通道预约 / 当前顺序）`);
+      L.push('');
+      if (!x.scenarios.length) {
+        L.push(`模拟关闭全部 ${x.edgeCount} 条原本可用通道，所有演员的路线、到达与等待均无变化。`);
+        L.push('');
+      } else {
+        L.push(`有影响 ${x.scenarios.length} 条、无影响 ${x.zeroImpactCount} 条；风险按「新增失败人次 → 最晚到达增量 → 总等待增量」字典序排列：`);
+        L.push('');
+        L.push('| 关闭的通道 | 新增失败 | 最晚到达增量 | 总等待增量 | 受影响演员（无路可走 / 改道后的到达、等待变化） |');
+        L.push('| --- | --- | --- | --- | --- |');
+        for (const sc of x.scenarios) {
+          const detail = sc.affected
+            .map((a) => {
+              if (a.noPath) {
+                return `${a.actorName}：**无路可走**（原经 ${a.baselineRoute.join(' → ')} ${a.baselineArriveAt}s 可达）`;
+              }
+              let s =
+                `${a.actorName}：到达 ${a.baselineArriveAt}s→${a.newArriveAt}s（${fmtDelta(a.arriveDelta)}），` +
+                `等待 ${a.baselineWaitSeconds}s→${a.newWaitSeconds}s（${fmtDelta(a.waitDelta)}）`;
+              if (a.routeChanged) s += `；改道 ${a.baselineRoute.join(' → ')} 改为 ${a.newRoute.join(' → ')}`;
+              return s;
+            })
+            .join('；');
+          L.push(
+            `| ${sc.edgeName}${sc.narrow ? '（窄通道）' : ''} | ${sc.addedFailures} 人 | ${fmtDelta(sc.maxArriveDelta)} | ${fmtDelta(sc.totalWaitDelta)} | ${detail.replace(/\|/g, '\\|')} |`,
+          );
+        }
+        L.push('');
+        if (x.zeroImpactCount) {
+          L.push(`<details><summary>其余 ${x.zeroImpactCount} 条通道关闭后无影响（点击展开）</summary>`);
+          L.push('');
+          L.push(
+            '无影响通道：' +
+              x.zeroImpactEdges.map((e) => `${e.edgeName}${e.narrow ? '（窄通道）' : ''}`).join('、'),
+          );
+          L.push('');
+          L.push('</details>');
+          L.push('');
+        }
+      }
     }
   }
 
