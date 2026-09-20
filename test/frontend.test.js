@@ -299,4 +299,105 @@ ok('示例剧目：当前顺序即所选方案，建议顺序保持演员表顺�
   assert.ok(html5.includes('建议顺序：周萍 → 蘩漪 → 四凤'));
 });
 
+console.log('== 通道韧性：渲染与筛选 ==');
+ok('韧性面板出现并含全剧汇总', () => {
+  assert.ok(html5.includes('通道韧性分析'), 'resilience box');
+  assert.ok(/全剧 3 个换场/.test(html5), 'summary line');
+  assert.ok(html5.includes('会新增失败的关边'), 'new-failure wording');
+});
+ok('风险按换场分组展示关边/有风险/无影响条数', () => {
+  assert.ok(html5.includes('模拟关边 11 条 · 有风险 3 条 · 无影响 8 条'));
+});
+ok('受影响演员展示改道后的到达变化', () => {
+  assert.ok(html5.includes('关闭「台心 ↔ 右台口」'), 'risk card edge');
+  assert.ok(html5.includes('+14s'), 'arrive delta');
+  assert.ok(html5.includes('新增失败 <b>0</b> 人次'));
+});
+ok('无路可走关边展示 ∞ 增量与受影响演员', () => {
+  assert.ok(html5.includes('关闭「右台口 ↔ 右台后」'));
+  assert.ok(html5.includes('∞（有人无路可走）'));
+  assert.ok(html5.includes('无路可走'));
+  assert.ok(html5.includes('新增失败 <b>1</b> 人次'));
+  assert.ok(html5.includes('rs-card has-fail') || html5.includes('has-fail'));
+});
+ok('最严峻关边提示指向阻断换场', () => {
+  assert.ok(html5.includes('第 3 场前'));
+});
+ok('无影响通道折叠列表', () => {
+  assert.ok(html5.includes('无影响的通道（8 条）'));
+});
+ok('汇总栏含关边新增失败条次', () => {
+  assert.ok(/关边会新增失败<b>\d+<\/b>\s*条次/.test(html5));
+});
+
+console.log('== 通道韧性：换场筛选 ==');
+ok('筛选下拉填充全部与各换场选项', () => {
+  vm.runInContext('renderResilienceFilter();', ctx);
+  const sel = elements['#resilienceTransitionSelect'];
+  assert.ok(sel.innerHTML.includes('全部换场（3）'));
+  assert.ok(sel.innerHTML.includes('第二幕·花园 → 第三幕·雷雨夜'));
+});
+ok('切换到单个换场后只显示该换场韧性', () => {
+  vm.runInContext(
+    `state.resilienceTransition = String(${report.transitions[0].index}); renderReport();`,
+    ctx,
+  );
+  const htmlSingle = elements['#checkResult'].innerHTML;
+  assert.ok(htmlSingle.includes('仅第 2 场前换场'));
+  // 韧性面板只含该换场：右台口↔右台后是第三组换场的韧性风险卡片，不应以韧性卡片出现
+  assert.ok(
+    !/rs-edge(?:(?!rs-edge)[\s\S])*?关闭「右台口 ↔ 右台后」/.test(htmlSingle),
+    '第二组换场韧性卡片不应出现',
+  );
+  assert.ok(htmlSingle.includes('关闭「台心 ↔ 右台口」'));
+  vm.runInContext("state.resilienceTransition = 'all'; renderReport();", ctx);
+});
+ok('无韧性数据时筛选栏隐藏（无移动演员剧目）', () => {
+  const staticDoc = {
+    name: '原地',
+    zones: [
+      { id: 'z1', name: '甲', x: 0, y: 0 },
+      { id: 'z2', name: '乙', x: 0, y: 0 },
+    ],
+    edges: [{ id: 'e1', a: 'z1', b: 'z2', seconds: 5 }],
+    actors: [{ id: 'a1', name: '演员' }],
+    scenes: [
+      { id: 's1', name: '一', durationFromPrev: null, placements: [{ actorId: 'a1', from: null, to: 'z1' }] },
+      { id: 's2', name: '二', durationFromPrev: 10, placements: [{ actorId: 'a1', from: 'z1', to: null }] },
+    ],
+    blocks: [],
+  };
+  const staticReport = analyze(staticDoc);
+  vm.runInContext(`state.doc = ${JSON.stringify(staticDoc)}; state.report = ${JSON.stringify(staticReport)};`, ctx);
+  vm.runInContext('renderResilienceFilter(); renderReport();', ctx);
+  assert.ok(!elements['#checkResult'].innerHTML.includes('通道韧性分析'));
+});
+
+console.log('== 通道韧性：Markdown 导出 ==');
+vm.runInContext(`state.doc = ${JSON.stringify(seed.seedPlays[0])}; state.report = ${JSON.stringify(report)};`, ctx);
+downloads.length = 0;
+vm.runInContext("state.resilienceTransition = 'all'; exportMarkdown();", ctx);
+const mdRs = downloads[0].content;
+ok('含通道韧性分析节与方法说明', () => {
+  assert.ok(mdRs.includes('## 通道韧性分析（逐条关闭一条原本可用的通道）'));
+  assert.ok(mdRs.includes('窄通道预约规则与当前演员表调度顺序重新计算'));
+  assert.ok(mdRs.includes('新增失败人次 → 最晚到达增量 → 总等待增量'));
+});
+ok('含最严峻关边与韧性明细表', () => {
+  assert.ok(mdRs.includes('最严峻关边：第 3 场前'));
+  assert.ok(mdRs.includes('### 韧性明细：第一幕·书房 → 第二幕·花园'));
+  assert.ok(mdRs.includes('| 关闭的通道 | 新增失败人次 | 最晚到达增量 | 总等待增量 | 受影响演员'));
+  assert.ok(mdRs.includes('关闭「右台口 ↔ 右台后」'));
+  assert.ok(mdRs.includes('无路可走（新增失败）') || mdRs.includes('**无路可走（新增失败）**'));
+  assert.ok(mdRs.includes('∞（有人无路可走）'));
+});
+ok('Markdown 韧性明细含改道路线与到达/等待变化', () => {
+  assert.ok(mdRs.includes('台心 ↔ 右台口'));
+  assert.ok(mdRs.includes('+14 秒'));
+  assert.ok(mdRs.includes('无影响的通道（8 条）'));
+});
+ok('报告头部统计含通道韧性一行', () => {
+  assert.ok(mdRs.includes('- 通道韧性：分析 3 个换场'));
+});
+
 console.log(`\n全部通过：${passed} 项`);

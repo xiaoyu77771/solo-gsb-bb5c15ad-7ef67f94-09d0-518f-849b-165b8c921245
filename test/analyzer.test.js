@@ -9,6 +9,8 @@ const {
   compareMetrics,
   simulateTransitionOrder,
   optimizeTransitionOrder,
+  analyzeTransitionResilience,
+  compareResilienceRisk,
   EXACT_ORDER_LIMIT,
 } = require('../server/analyzer');
 const seed = require('../server/seed');
@@ -577,6 +579,234 @@ ok('台下、不可达与原地不动者不参与', () => {
   assert.strictEqual(t.results.find((r) => r.actorName === '孤岛者').status, 'unreachable');
   assert.strictEqual(t.optimization.actorCount, 2); // 仅甲、乙参与
   assert.deepStrictEqual(t.optimization.current.orderActorNames, ['甲', '乙']);
+});
+
+console.log('== 通道韧性分析 ==');
+ok('示例剧目：三个转场均给出韧性分析，仅统计两端未阻断的边', () => {
+  assert.strictEqual(seedReport.resilienceSummary.transitionCount, 3);
+  const t0 = seedReport.transitions[0];
+  assert.strictEqual(t0.resilience.moverCount, 3);
+  assert.strictEqual(t0.resilience.edgeClosureCount, 11); // 无阻断，全部 11 条边可用
+  assert.strictEqual(
+    t0.resilience.edgeClosureCount,
+    t0.resilience.risks.length + t0.resilience.unaffectedEdgeClosureCount,
+  );
+  // 第二幕→第三幕有 2 个阻断区域，与其邻接的边不算“原本可用”
+  const t2 = seedReport.transitions[1];
+  const blocked = new Set(['z5', 'z3']);
+  const usable = seed.seedPlays[0].edges.filter((e) => !blocked.has(e.a) && !blocked.has(e.b));
+  assert.strictEqual(t2.resilience.edgeClosureCount, usable.length);
+});
+ok('示例剧目：关闭「台心↔右台口」使周萍改道左台后绕右台后，晚到 14 秒', () => {
+  const t0 = seedReport.transitions[0];
+  const risk = t0.resilience.risks.find((x) => x.edgeName === '台心 ↔ 右台口');
+  assert.ok(risk, '该关边有风险');
+  assert.strictEqual(risk.newFailureCount, 0);
+  assert.strictEqual(risk.maxArriveDelta, 14);
+  const zp = risk.affectedActors.find((a) => a.actorName === '周萍');
+  assert.ok(zp);
+  assert.strictEqual(zp.outcome, 'rerouted');
+  assert.strictEqual(zp.arriveAt, 30); // 基线 16
+  assert.strictEqual(zp.arriveDelta, 14);
+});
+ok('示例剧目：阻断换场中关闭「右台口↔右台后」使四凤无路可走（新增失败）', () => {
+  const t1 = seedReport.transitions[1];
+  const risk = t1.resilience.risks.find((x) => x.edgeName === '右台口 ↔ 右台后');
+  assert.ok(risk);
+  assert.strictEqual(risk.newFailureCount, 1);
+  assert.strictEqual(risk.maxArriveDelta, null);
+  assert.strictEqual(risk.totalWaitDelta, null);
+  const sf = risk.affectedActors.find((a) => a.actorName === '四凤');
+  assert.strictEqual(sf.outcome, 'trapped');
+  assert.strictEqual(sf.newFailure, true);
+  assert.deepStrictEqual(sf.baselineRouteZoneNames, ['右台后', '右台口']);
+  // 基线即被阻断的演员（周萍、蘩漪）不算新增失败
+  assert.strictEqual(risk.affectedActors.filter((a) => a.outcome === 'trapped').length, 1);
+});
+ok('风险按新增失败 → 最晚增量 → 等待增量字典序降序', () => {
+  for (const t of seedReport.transitions) {
+    if (!t.resilience) continue;
+    for (let i = 1; i < t.resilience.risks.length; i++) {
+      assert.ok(!compareResilienceRisk(
+        t.resilience.risks[i].riskKey,
+        t.resilience.risks[i - 1].riskKey,
+      ));
+    }
+  }
+  assert.ok(compareResilienceRisk([1, null, null], [0, 999, 999]));
+  assert.ok(compareResilienceRisk([0, null, 0], [0, 999, 0]));
+  assert.ok(compareResilienceRisk([0, 5, null], [0, 5, 9]));
+  assert.strictEqual(compareResilienceRisk([0, 5, 3], [0, 5, 3]), false);
+});
+ok('顶层摘要的最严峻关边为阻断换场的无路可走关边', () => {
+  const s = seedReport.resilienceSummary;
+  assert.strictEqual(s.worst.transitionIndex, 2);
+  assert.strictEqual(s.worst.risk.newFailureCount, 1);
+  assert.ok(s.edgeClosureCount >= s.riskEdgeCount);
+});
+ok('没有需要移动演员的换场不产生韧性分析', () => {
+  const doc = {
+    name: '原地',
+    zones: [
+      { id: 'z1', name: '甲', x: 0, y: 0 },
+      { id: 'z2', name: '乙', x: 0, y: 0 },
+    ],
+    edges: [{ id: 'e1', a: 'z1', b: 'z2', seconds: 5 }],
+    actors: [{ id: 'a1', name: '演员' }],
+    scenes: [
+      { id: 's1', name: '一', durationFromPrev: null, placements: [{ actorId: 'a1', from: null, to: 'z1' }] },
+      { id: 's2', name: '二', durationFromPrev: 10, placements: [{ actorId: 'a1', from: 'z1', to: null }] },
+    ],
+    blocks: [],
+  };
+  const rep = analyze(doc);
+  assert.strictEqual(rep.transitions[0].resilience, null);
+  assert.strictEqual(rep.resilienceSummary, null);
+});
+ok('独立函数 analyzeTransitionResilience 契约一致', () => {
+  const rep = analyze(seed.seedPlays[0]);
+  const t = rep.transitions[0];
+  const direct = analyzeTransitionResilience(seed.seedPlays[0], t, []);
+  assert.strictEqual(direct.edgeClosureCount, t.resilience.edgeClosureCount);
+  assert.deepStrictEqual(
+    direct.risks.map((x) => x.edgeId),
+    t.resilience.risks.map((x) => x.edgeId),
+  );
+});
+
+/* 菱形双通道韧性场景：甲→丁有两条等长路径，乙→丙使用上通道。
+ * 关闭任一通道均可达：关上边 → 甲走下通道（+0），乙无路（基线可达 z2→z3? 乙 z2→z3 走 z2-z1-z4-z3 可达 21）。
+ * 重点验证：仅关闭唯一/唯一相关通道时的改道增量与排序。 */
+const diamondDoc = {
+  name: '韧性菱形',
+  zones: [
+    { id: 'z1', name: '左', x: 0, y: 0 },
+    { id: 'z2', name: '上', x: 0, y: 0 },
+    { id: 'z3', name: '右', x: 0, y: 0 },
+    { id: 'z4', name: '下', x: 0, y: 0 },
+  ],
+  edges: [
+    { id: 'e1', a: 'z1', b: 'z2', seconds: 2, narrow: true },
+    { id: 'e2', a: 'z2', b: 'z3', seconds: 2 },
+    { id: 'e3', a: 'z1', b: 'z4', seconds: 5 },
+    { id: 'e4', a: 'z4', b: 'z3', seconds: 5 },
+  ],
+  actors: [
+    { id: 'a1', name: '甲' },
+    { id: 'a2', name: '乙' },
+  ],
+  scenes: [
+    {
+      id: 's1',
+      name: '一',
+      durationFromPrev: null,
+      placements: [
+        { actorId: 'a1', from: null, to: 'z1' },
+        { actorId: 'a2', from: null, to: 'z2' },
+      ],
+    },
+    {
+      id: 's2',
+      name: '二',
+      durationFromPrev: 20,
+      placements: [
+        { actorId: 'a1', from: 'z3', to: null },
+        { actorId: 'a2', from: 'z1', to: null },
+      ],
+    },
+  ],
+  blocks: [],
+};
+const diamondReport = analyze(diamondDoc);
+const dr = diamondReport.transitions[0].resilience;
+ok('菱形：关闭上通道第一段（窄）使甲改道下通道，4→10（+6）', () => {
+  const risk = dr.risks.find((x) => x.edgeId === 'e1');
+  assert.ok(risk);
+  assert.strictEqual(risk.newFailureCount, 0);
+  // 甲改道 10、乙也被迫经右→下绕回左（12），聚合最晚增量 12−4=8
+  assert.strictEqual(risk.maxArriveDelta, 8);
+  const jia = risk.affectedActors.find((a) => a.actorName === '甲');
+  assert.strictEqual(jia.outcome, 'rerouted');
+  assert.deepStrictEqual(jia.simulatedRouteZoneNames, ['左', '下', '右']);
+  assert.strictEqual(jia.arriveDelta, 6);
+  const yi = risk.affectedActors.find((a) => a.actorName === '乙');
+  assert.strictEqual(yi.arriveAt, 12);
+});
+ok('菱形：关闭下通道各边不影响任何人（甲走上通道）→ 计入无影响', () => {
+  assert.ok(dr.unaffectedEdgeIds.includes('e3'));
+  assert.ok(dr.unaffectedEdgeIds.includes('e4'));
+  assert.strictEqual(dr.unaffectedEdgeClosureCount, 2);
+});
+ok('菱形：风险首位为 e1（聚合最晚 +8），关 e2 次之（+6）', () => {
+  assert.strictEqual(dr.risks[0].edgeId, 'e1');
+  assert.strictEqual(dr.risks[0].maxArriveDelta, 8);
+  assert.strictEqual(dr.risks[1].edgeId, 'e2');
+  assert.strictEqual(dr.risks[1].maxArriveDelta, 6);
+});
+
+/* 韧性中的新增拥堵：关闭绕行普通边后，演员只能等待窄通道，原本按时变为超时 */
+const resilienceCongestDoc = {
+  name: '韧性拥堵',
+  zones: [
+    { id: 'z1', name: '甲', x: 0, y: 0 },
+    { id: 'z2', name: '乙', x: 0, y: 0 },
+    { id: 'z3', name: '丙', x: 0, y: 0 },
+  ],
+  edges: [
+    { id: 'e1', a: 'z1', b: 'z2', seconds: 5, narrow: true },
+    { id: 'e2', a: 'z1', b: 'z3', seconds: 3 },
+    { id: 'e3', a: 'z3', b: 'z2', seconds: 3 },
+  ],
+  actors: [
+    { id: 'a1', name: '先行' },
+    { id: 'a2', name: '后行' },
+  ],
+  scenes: [
+    {
+      id: 's1',
+      name: '一',
+      durationFromPrev: null,
+      placements: [
+        { actorId: 'a1', from: null, to: 'z1' },
+        { actorId: 'a2', from: null, to: 'z1' },
+      ],
+    },
+    {
+      id: 's2',
+      name: '二',
+      durationFromPrev: 9, // 基线：先行 5s 到；后行绕路 6s 到，均按时
+      placements: [
+        { actorId: 'a1', from: 'z2', to: null },
+        { actorId: 'a2', from: 'z2', to: null },
+      ],
+    },
+  ],
+  blocks: [],
+};
+const rcReport = analyze(resilienceCongestDoc);
+const rcr = rcReport.transitions[0].resilience;
+ok('基线全部按时，关闭绕行边 e2/e3 后后行只能等窄通道（10s > 9）→ 新增失败 1 人次', () => {
+  const risk = rcr.risks.find((x) => x.edgeId === 'e2');
+  assert.ok(risk);
+  assert.strictEqual(risk.newFailureCount, 1);
+  const hou = risk.affectedActors.find((a) => a.actorName === '后行');
+  assert.strictEqual(hou.newFailure, true);
+  assert.strictEqual(hou.status, 'congested');
+  assert.strictEqual(hou.arriveAt, 10);
+  assert.strictEqual(hou.arriveDelta, 4); // 基线绕路 6s
+});
+ok('新增失败风险排在仅时间增量风险之前；无路可走（null 增量）最优先', () => {
+  // 关 e1（窄通道本身）：后行仍可绕路 6s，先行也绕路 6s，无新增失败
+  const e1Risk = rcr.risks.find((x) => x.edgeId === 'e1');
+  assert.strictEqual(e1Risk.newFailureCount, 0);
+  assert.ok(rcr.risks.findIndex((x) => x.edgeId === 'e2') < rcr.risks.findIndex((x) => x.edgeId === 'e1'));
+});
+ok('韧性模拟沿用窄通道预约：关闭普通边 e3 后先行行程不变（不在受影响名单）', () => {
+  const risk = rcr.risks.find((x) => x.edgeId === 'e3');
+  assert.strictEqual(risk.affectedActors.find((a) => a.actorName === '先行'), undefined);
+  const hou = risk.affectedActors.find((a) => a.actorName === '后行');
+  assert.strictEqual(hou.arriveAt, 10);
+  assert.strictEqual(hou.waitSeconds, 5); // 等先行占用窄通道 5s，说明预约表正常生效
 });
 
 console.log(`\n全部通过：${passed} 项`);

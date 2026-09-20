@@ -17,6 +17,7 @@ const state = {
   connectMode: false,
   connectFrom: null, // 连线模式中已点击的第一个区域 id
   report: null,
+  resilienceTransition: 'all', // 通道韧性筛选：'all' 或换场 index（字符串）
   counters: { z: 0, e: 0, a: 0, s: 0 },
 };
 
@@ -633,6 +634,7 @@ async function runCheck() {
   try {
     state.report = await api('POST', '/api/analyze', state.doc);
     renderReport();
+    renderResilienceFilter();
     $('#btnExportJson').disabled = false;
     $('#btnExportMd').disabled = false;
     if (!state.report.ok) toast(`文档存在 ${state.report.errors.length} 个问题，请先修正`, true);
@@ -738,6 +740,147 @@ function optimizationHtml(t) {
     </div>`;
 }
 
+/* ============================================================
+ * 通道韧性分析
+ * ============================================================ */
+
+/** 秒数增量的有符号文案 */
+function signedDelta(d, unit = 's') {
+  if (d == null) return '—';
+  if (d === 0) return '±0';
+  return (d > 0 ? '+' : '−') + Math.abs(d) + unit;
+}
+
+/** 单个受影响演员的条目：无路可走 / 改道后的到达、等待变化 */
+function resilienceActorHtml(a) {
+  if (a.outcome === 'trapped') {
+    return `
+      <div class="rs-actor trapped">
+        <span class="ar-actor">${esc(a.actorName)}</span>
+        <span class="rs-outcome">⛔ 无路可走</span>
+        <span class="rs-detail">原路线 ${a.baselineRouteZoneNames.map(esc).join(' → ')}（原 ${a.baselineArriveAt}s 到达${a.baselineWaitSeconds ? `、等待 ${a.baselineWaitSeconds}s` : ''}），关闭后在不可穿越区域约束下已无可达路线</span>
+        <span class="rs-newfail">新增失败</span>
+      </div>`;
+  }
+  const changes = [];
+  if (a.arriveDelta !== 0) changes.push(`到达 ${a.baselineArriveAt}s → ${a.arriveAt}s（${signedDelta(a.arriveDelta)}）`);
+  else changes.push(`到达不变（${a.arriveAt}s）`);
+  if (a.waitDelta !== 0) changes.push(`等待 ${a.baselineWaitSeconds}s → ${a.waitSeconds}s（${signedDelta(a.waitDelta)}）`);
+  else changes.push(`等待不变（${a.waitSeconds}s）`);
+  const routeNote = a.simulatedRouteZoneNames.join(' → ') !== a.baselineRouteZoneNames.join(' → ')
+    ? `改道：${a.baselineRouteZoneNames.map(esc).join(' → ')} → <b>${a.simulatedRouteZoneNames.map(esc).join(' → ')}</b>`
+    : '路线不变（时刻变化）';
+  return `
+    <div class="rs-actor ${a.newFailure ? 'newfail' : ''}">
+      <span class="ar-actor">${esc(a.actorName)}</span>
+      <span class="rs-detail">${routeNote}；${changes.map(esc).join('；')}</span>
+      ${a.newFailure ? '<span class="rs-newfail">新增失败</span>' : ''}
+    </div>`;
+}
+
+/** 单个关边风险卡片 */
+function resilienceRiskCard(t, risk) {
+  const key = risk.riskKey;
+  const maxArr = key[1] == null ? '∞（有人无路可走）' : signedDelta(key[1]);
+  const waitD = key[2] == null ? '∞（有人无路可走）' : signedDelta(key[2]);
+  const actors = risk.affectedActors.length
+    ? risk.affectedActors.map(resilienceActorHtml).join('')
+    : '<p class="hint" style="margin:2px 0">无演员受影响</p>';
+  return `
+    <div class="rs-card ${risk.newFailureCount > 0 ? 'has-fail' : ''}">
+      <div class="rs-card-head">
+        <span class="rs-edge ${risk.narrow ? 'narrow' : ''}">${risk.narrow ? '🚧 窄通道 ' : ''}关闭「${esc(risk.edgeName)}」（${risk.seconds}s）</span>
+        <span class="rs-metrics">
+          <span class="rs-k ${key[0] > 0 ? 'bad' : ''}">新增失败 <b>${key[0]}</b> 人次</span>
+          <span class="rs-k ${key[1] == null ? 'bad' : key[1] > 0 ? 'warn' : ''}">最晚到达增量 <b>${maxArr}</b></span>
+          <span class="rs-k ${key[2] == null ? 'bad' : key[2] > 0 ? 'warn' : ''}">总等待增量 <b>${waitD}</b></span>
+        </span>
+      </div>
+      <div class="rs-actors">${actors}</div>
+    </div>`;
+}
+
+/** 韧性分析面板（全部换场汇总或单换场筛选） */
+function resilienceHtml() {
+  const r = state.report;
+  if (!r || !r.ok || !r.resilienceSummary) return '';
+  const mode = state.resilienceTransition;
+  const analyzed = r.transitions.filter((t) => t.resilience);
+
+  let body = '';
+  let totalClosures = 0;
+  let totalRisks = 0;
+  const shown = [];
+
+  for (const t of analyzed) {
+    if (mode !== 'all' && String(t.index) !== String(mode)) continue;
+    shown.push(t);
+    totalClosures += t.resilience.edgeClosureCount;
+    totalRisks += t.resilience.risks.length;
+    const cards = t.resilience.risks.length
+      ? t.resilience.risks.map((risk) => resilienceRiskCard(t, risk)).join('')
+      : '<p class="hint" style="margin:4px 0">关闭任意一条原本可用的通道都不会产生影响。</p>';
+    body += `
+      <div class="rs-transition">
+        <div class="rs-transition-head">
+          第 ${t.index + 1} 场前 · ${esc(t.fromSceneName)} → ${esc(t.toSceneName)}
+          <span class="meta">模拟关边 ${t.resilience.edgeClosureCount} 条 · 有风险 ${t.resilience.risks.length} 条 · 无影响 ${t.resilience.unaffectedEdgeClosureCount} 条</span>
+        </div>
+        ${cards}
+        ${
+          t.resilience.unaffectedEdgeClosureCount
+            ? `<details class="rs-unaffected"><summary>无影响的通道（${t.resilience.unaffectedEdgeClosureCount} 条）</summary><p class="hint">${t.resilience.unaffectedEdgeNames.map(esc).join('；')}</p></details>`
+            : ''
+        }
+      </div>`;
+  }
+
+  if (!shown.length) body = '<p class="hint">该换场没有需要移动且静态可达的演员，无需韧性分析。</p>';
+
+  const s = r.resilienceSummary;
+  const w = s.worst;
+  const worstText = w
+    ? `最严峻：第 ${w.transitionIndex + 1} 场前「${esc(w.fromSceneName)} → ${esc(w.toSceneName)}」关闭「${esc(w.risk.edgeName)}」` +
+      `（新增失败 ${w.risk.newFailureCount} 人次${w.risk.maxArriveDelta == null ? '、有人无路可走' : `、最晚到达增量 ${signedDelta(w.risk.maxArriveDelta)}`}${w.risk.totalWaitDelta == null ? '' : `、总等待增量 ${signedDelta(w.risk.totalWaitDelta)}`}）`
+    : '关闭任意一条原本可用的通道均不产生影响 ✅';
+
+  return `
+    <div class="resilience-box">
+      <div class="resilience-head">
+        🛡️ 通道韧性分析
+        <span class="meta">全剧 ${s.transitionCount} 个换场 · 共模拟关边 ${s.edgeClosureCount} 条次 · 有风险 ${s.riskEdgeCount} 条次 · 会新增失败的关边 ${s.newFailureEdgeCount} 条次（合计新增失败 ${s.totalNewFailures} 人次）</span>
+      </div>
+      <div class="rs-verdict ${w ? (w.risk.newFailureCount > 0 ? 'bad' : 'warn') : 'ok'}">${worstText}</div>
+      <div class="meta" style="margin:2px 0 8px">当前显示：${mode === 'all' ? `全部 ${shown.length} 个换场，关边风险 ${totalRisks} 条` : `仅第 ${Number(mode) + 1} 场前换场（模拟关边 ${totalClosures} 条，有风险 ${totalRisks} 条）`}；风险按「新增失败人次 → 最晚到达增量 → 总等待增量」字典序降序排列。</div>
+      ${body}
+    </div>`;
+}
+
+/** 运行检查后填充换场筛选下拉框 */
+function renderResilienceFilter() {
+  const bar = $('#resilienceFilterBar');
+  const sel = $('#resilienceTransitionSelect');
+  const r = state.report;
+  if (!r || !r.ok || !r.resilienceSummary) {
+    bar.classList.add('hidden');
+    return;
+  }
+  bar.classList.remove('hidden');
+  const analyzed = r.transitions.filter((t) => t.resilience);
+  sel.innerHTML =
+    `<option value="all">全部换场（${analyzed.length}）</option>` +
+    analyzed
+      .map(
+        (t) =>
+          `<option value="${t.index}">第 ${t.index + 1} 场前 · ${esc(t.fromSceneName)} → ${esc(t.toSceneName)}</option>`,
+      )
+      .join('');
+  sel.value = analyzed.some((t) => String(t.index) === String(state.resilienceTransition))
+    ? state.resilienceTransition
+    : 'all';
+  state.resilienceTransition = sel.value;
+}
+
 function renderReport() {
   const r = state.report;
   const box = $('#checkResult');
@@ -761,6 +904,11 @@ function renderReport() {
       <span class="summary-item">演员转场检查<b>${r.stats.checkedActorTransitions}</b></span>
       <span class="summary-item">失败转场人次<b>${r.stats.failedActorTransitions}</b></span>
       <span class="summary-item">其中窄通道拥堵<b>${r.stats.congestedActorTransitions}</b></span>
+      ${
+        r.resilienceSummary
+          ? `<span class="summary-item">关边会新增失败<b>${r.resilienceSummary.newFailureEdgeCount}</b> 条次</span>`
+          : ''
+      }
     </div>`;
 
     if (r.firstImpossible) {
@@ -793,6 +941,8 @@ function renderReport() {
         .map((w) => `<li>${esc(w)}</li>`)
         .join('')}</ul></div>`;
     }
+
+    html += resilienceHtml();
 
     const firstBadIdx = r.transitions.findIndex((x) => !x.possible);
     for (const [ti, t] of r.transitions.entries()) {
@@ -890,6 +1040,12 @@ function exportMarkdown() {
     `- 演员转场检查：${r.stats.checkedActorTransitions} 人次；失败：${r.stats.failedActorTransitions} 人次` +
       (r.stats.congestedActorTransitions ? `（其中窄通道拥堵 ${r.stats.congestedActorTransitions} 人次）` : ''),
   );
+  if (r.resilienceSummary) {
+    L.push(
+      `- 通道韧性：分析 ${r.resilienceSummary.transitionCount} 个换场，模拟关边 ${r.resilienceSummary.edgeClosureCount} 条次，` +
+        `会新增失败的关边 ${r.resilienceSummary.newFailureEdgeCount} 条次（合计新增失败 ${r.resilienceSummary.totalNewFailures} 人次）`,
+    );
+  }
   L.push(`- 总体结论：**${!r.ok ? '文档校验未通过' : r.firstImpossible ? '存在不可能转场 ❌' : '全部转场连续 ✅'}**`);
   L.push('');
 
@@ -925,6 +1081,86 @@ function exportMarkdown() {
     L.push('## 绕行 / 提示');
     r.warnings.forEach((w) => L.push(`- ${w}`));
     L.push('');
+  }
+
+  if (r.resilienceSummary) {
+    const rs = r.resilienceSummary;
+    const mdSigned = (d) => {
+      if (d == null) return '∞（有人无路可走）';
+      if (d === 0) return '±0 秒';
+      return signedDelta(d, ' 秒');
+    };
+    L.push('## 通道韧性分析（逐条关闭一条原本可用的通道）');
+    L.push('');
+    L.push(
+      '> 对每个有演员转场的换场，逐条模拟关闭一条原本可用的邻接通道，沿用该换场的不可穿越区域、窄通道预约规则与当前演员表调度顺序重新计算；' +
+        '风险按「新增失败人次 → 最晚到达增量 → 总等待增量」字典序降序排列。',
+    );
+    L.push('');
+    L.push(
+      `- 分析换场 ${rs.transitionCount} 个；共模拟关边 ${rs.edgeClosureCount} 条次；有风险 ${rs.riskEdgeCount} 条次；` +
+        `会新增失败的关边 ${rs.newFailureEdgeCount} 条次（合计新增失败 ${rs.totalNewFailures} 人次）。`,
+    );
+    if (rs.worst) {
+      const w = rs.worst;
+      L.push(
+        `- 最严峻关边：第 ${w.transitionIndex + 1} 场前「${w.fromSceneName} → ${w.toSceneName}」关闭「${w.risk.edgeName}」` +
+          `（新增失败 ${w.risk.newFailureCount} 人次；最晚到达增量 ${mdSigned(w.risk.maxArriveDelta)}；总等待增量 ${mdSigned(w.risk.totalWaitDelta)}）。`,
+      );
+    } else {
+      L.push('- 关闭任意一条原本可用的通道均不产生影响。');
+    }
+    L.push('');
+
+    for (const t of r.transitions) {
+      if (!t.resilience) continue;
+      L.push(
+        `### 韧性明细：${t.fromSceneName} → ${t.toSceneName}（第 ${t.index + 1} 场前）` +
+          ` — 模拟关边 ${t.resilience.edgeClosureCount} 条，有风险 ${t.resilience.risks.length} 条，无影响 ${t.resilience.unaffectedEdgeClosureCount} 条`,
+      );
+      L.push('');
+      if (t.resilience.risks.length) {
+        L.push('| 关闭的通道 | 新增失败人次 | 最晚到达增量 | 总等待增量 | 受影响演员（无路可走 / 改道后的到达、等待变化） |');
+        L.push('| --- | --- | --- | --- | --- |');
+        for (const risk of t.resilience.risks) {
+          const actorCell = risk.affectedActors.length
+            ? risk.affectedActors
+                .map((a) => {
+                  if (a.outcome === 'trapped') {
+                    return (
+                      `${a.actorName}：⛔ **无路可走（新增失败）**；原路线 ${a.baselineRouteZoneNames.join(' → ')}，` +
+                      `原 ${a.baselineArriveAt} 秒到达${a.baselineWaitSeconds ? `、等待 ${a.baselineWaitSeconds} 秒` : ''}`
+                    );
+                  }
+                  const routeChanged =
+                    a.simulatedRouteZoneNames.join(' → ') !== a.baselineRouteZoneNames.join(' → ');
+                  const parts = [
+                    routeChanged
+                      ? `改道 ${a.baselineRouteZoneNames.join(' → ')} → ${a.simulatedRouteZoneNames.join(' → ')}`
+                      : '路线不变',
+                    `到达 ${a.baselineArriveAt} → ${a.arriveAt} 秒（${signedDelta(a.arriveDelta, ' 秒')}）`,
+                    `等待 ${a.baselineWaitSeconds} → ${a.waitSeconds} 秒（${signedDelta(a.waitDelta, ' 秒')}）`,
+                  ];
+                  return `${a.actorName}${a.newFailure ? '（**新增失败**）' : ''}：${parts.join('；')}`;
+                })
+                .join('；')
+            : '无';
+          L.push(
+            `| ${risk.narrow ? '窄通道 ' : ''}${risk.edgeName}（${risk.seconds} 秒） | ${risk.newFailureCount} | ${mdSigned(
+              risk.maxArriveDelta,
+            )} | ${mdSigned(risk.totalWaitDelta)} | ${actorCell.replace(/\|/g, '\\|')} |`,
+          );
+        }
+        L.push('');
+      } else {
+        L.push('关闭任意一条原本可用的通道都不会产生影响。');
+        L.push('');
+      }
+      if (t.resilience.unaffectedEdgeClosureCount) {
+        L.push(`无影响的通道（${t.resilience.unaffectedEdgeClosureCount} 条）：${t.resilience.unaffectedEdgeNames.join('；')}。`);
+        L.push('');
+      }
+    }
   }
 
   L.push('## 逐场转场明细');
@@ -1102,6 +1338,10 @@ function bindEvents() {
   $('#btnRunCheck').addEventListener('click', runCheck);
   $('#btnExportJson').addEventListener('click', exportJson);
   $('#btnExportMd').addEventListener('click', exportMarkdown);
+  $('#resilienceTransitionSelect').addEventListener('change', (ev) => {
+    state.resilienceTransition = ev.target.value;
+    if (state.report) renderReport();
+  });
 
   // 离开页面前提醒未保存内容
   window.addEventListener('beforeunload', (ev) => {

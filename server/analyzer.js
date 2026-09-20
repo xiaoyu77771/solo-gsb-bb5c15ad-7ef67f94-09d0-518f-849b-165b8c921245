@@ -14,6 +14,10 @@
  * 每次转场按演员表顺序做预约调度：普通边可同时通行；窄通道边被某演员占用的
  * 时间段内其他演员不得进入，后续演员可在区域等待或选择绕路（取计入等待后
  * 最早到达的路线）。
+ *
+ * 通道韧性（resilience）：每个转场另对每一条原本可用的邻接边模拟关闭一次，
+ * 沿用同组阻断、窄通道预约规则与当前演员表顺序重新调度，按新增失败人次、
+ * 最晚到达增量、总等待增量的字典序排列关边风险。
  */
 
 /** 简单二叉最小堆，元素 [key, nodeId] */
@@ -508,6 +512,218 @@ function optimizeTransitionOrder(doc, blockedZoneIds, participants, limit) {
 }
 
 /**
+ * ============================================================
+ * 通道韧性（channel resilience）
+ *
+ * 对每个有演员转场的换场，逐条模拟“关闭一条原本可用的通道”（一条邻接边），
+ * 沿用该换场自身的区域阻断、窄通道预约规则与当前演员表调度顺序重新调度，
+ * 与基线（通道全开）逐人对比：
+ *
+ *   新增失败人次 = 基线可达（ok/congested/timeout）而关闭后无路可走的演员数
+ *     （状态变为 unreachable；基线即不可达者无路可走与关闭哪条边无关，不计入）
+ *   最晚到达增量 = 关闭后最大到达 − 基线最大到达（仅统计基线可达者；有人无路
+ *     可走时记为 null，排序时视为 +∞）
+ *   总等待增量 = 关闭后总等待 − 基线总等待（仅统计关闭后仍可达者；有人无路
+ *     可走时记为 null，排序时视为 +∞）
+ *
+ * 风险按 [新增失败人次, 最晚到达增量, 总等待增量] 字典序降序排列；完全并列时
+ * 以文档中的边顺序稳定决胜。无任何影响的边归入 unaffectedEdgeClosures。
+ * ============================================================
+ */
+
+/** 通道韧性风险键比较（字典序降序：a 比 b 风险更大返回 true）；null 分量视为 +∞ */
+function compareResilienceRisk(a, b) {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] === b[i]) continue;
+    if (a[i] === null) return true;
+    if (b[i] === null) return false;
+    return a[i] > b[i];
+  }
+  return false;
+}
+
+/** 从既有调度结果取实际路线区域名序列（无 legs 时退回静态最短路） */
+function resultRouteNames(result, zoneNameOf) {
+  if (result.schedule && result.schedule.legs.length) {
+    return [result.schedule.legs[0].fromZoneName || zoneNameOf(result.fromZoneId), ...result.schedule.legs.map((l) => l.toZoneName || zoneNameOf(l.toZoneId))];
+  }
+  return (result.pathZoneNames || []).slice();
+}
+
+/**
+ * 计算一个换场的通道韧性分析。
+ * @param doc 已校验文档
+ * @param transition analyze() 已算好的转场结果（含 results，results 中的 schedule 按演员表顺序）
+ * @param blockedZoneIds 该换场的不可穿越区域
+ * @returns 无需要移动且静态可达的演员时返回 null
+ */
+function analyzeTransitionResilience(doc, transition, blockedZoneIds) {
+  const zoneName = (id) => {
+    const z = doc.zones.find((zz) => zz.id === id);
+    return z ? z.name : String(id);
+  };
+
+  // 需要重新模拟的演员：需移动（起 ≠ 止）且基线静态可达（含 ok/congested/timeout）。
+  // 台下、原地不动、基线不可达者与“关闭哪条边”无关，不参与模拟与指标统计。
+  const movers = transition.results.filter(
+    (r) => !r.offstage && r.status !== 'unreachable' && r.fromZoneId !== r.toZoneId,
+  );
+  if (!movers.length) return null;
+
+  const blockedSet = new Set(blockedZoneIds || []);
+  // 原本可用的边：两端区域均存在且均不在该换场的不可穿越区域中
+  const usableEdges = doc.edges.filter((e) => !blockedSet.has(e.a) && !blockedSet.has(e.b));
+
+  const baselineRouteNames = new Map();
+  let baselineMaxArrive = 0;
+  let baselineTotalWait = 0;
+  for (const r of movers) {
+    baselineRouteNames.set(r.actorId, resultRouteNames(r, zoneName));
+    baselineMaxArrive = Math.max(baselineMaxArrive, r.arriveAt || 0);
+    baselineTotalWait += r.waitSeconds || 0;
+  }
+
+  /** 关闭一条边后，按当前演员表顺序重新调度全部 movers（重新生成预约表） */
+  function resimulate(closedEdgeId) {
+    const remainingEdges = doc.edges.filter((e) => e.id !== closedEdgeId);
+    const adj = buildAdjacency(doc.zones, remainingEdges);
+    const reservations = new Map();
+    const out = [];
+    for (const r of movers) {
+      const { dist } = dijkstra(doc.zones, remainingEdges, r.fromZoneId, blockedZoneIds);
+      if (!dist.has(r.toZoneId)) {
+        out.push({ baseline: r, sim: null, status: 'unreachable' });
+        continue;
+      }
+      const sch = schedulePathOnAdj(adj, r.fromZoneId, r.toZoneId, blockedSet, reservations);
+      registerScheduleReservations(reservations, sch, r.actorId, r.actorName);
+      let status = 'ok';
+      if (dist.get(r.toZoneId) > transition.limitSeconds) status = 'timeout';
+      else if (sch.arriveAt > transition.limitSeconds) status = 'congested';
+      out.push({ baseline: r, sim: sch, status });
+    }
+    return out;
+  }
+
+  const risks = [];
+  let unaffectedCount = 0;
+  const unaffectedEdgeIds = [];
+
+  for (const edge of usableEdges) {
+    const sims = resimulate(edge.id);
+    let newFailures = 0;
+    let simMaxArrive = 0;
+    let simTotalWait = 0;
+    let anyoneTrapped = false;
+    const affectedActors = [];
+
+    for (const { baseline: r, sim, status } of sims) {
+      const baseRoute = baselineRouteNames.get(r.actorId);
+      if (!sim) {
+        // 基线可达 → 关闭后无路可走：新增失败
+        newFailures += 1;
+        anyoneTrapped = true;
+        affectedActors.push({
+          actorId: r.actorId,
+          actorName: r.actorName,
+          outcome: 'trapped',
+          baselineStatus: r.status,
+          baselineArriveAt: r.arriveAt,
+          baselineWaitSeconds: r.waitSeconds || 0,
+          arriveDelta: null,
+          waitDelta: null,
+          baselineRouteZoneNames: baseRoute,
+          simulatedRouteZoneNames: [],
+          newFailure: true,
+        });
+        continue;
+      }
+      simMaxArrive = Math.max(simMaxArrive, sim.arriveAt);
+      simTotalWait += sim.totalWaitSeconds;
+
+      const simRouteNames = sim.legs.length
+        ? [sim.legs[0].fromZoneId, ...sim.legs.map((l) => l.toZoneId)].map(zoneName)
+        : baseRoute;
+      const arriveDelta = sim.arriveAt - r.arriveAt;
+      const waitDelta = sim.totalWaitSeconds - (r.waitSeconds || 0);
+      const simRouteEdgeIds = sim.legs.map((l) => l.edgeId);
+      const baseRouteEdgeIds = (r.schedule && r.schedule.legs ? r.schedule.legs : []).map((l) => l.edgeId);
+      const rerouted =
+        simRouteEdgeIds.length !== baseRouteEdgeIds.length ||
+        simRouteEdgeIds.some((id, idx) => id !== baseRouteEdgeIds[idx]);
+      // 基线按时可达，关闭后变为超时 / 拥堵，也算新增失败
+      const newFailure =
+        r.status === 'ok' && (status === 'timeout' || status === 'congested');
+      if (newFailure) newFailures += 1;
+      if (arriveDelta !== 0 || waitDelta !== 0 || rerouted || newFailure) {
+        affectedActors.push({
+          actorId: r.actorId,
+          actorName: r.actorName,
+          outcome: 'rerouted',
+          baselineStatus: r.status,
+          status,
+          baselineArriveAt: r.arriveAt,
+          arriveAt: sim.arriveAt,
+          arriveDelta,
+          baselineWaitSeconds: r.waitSeconds || 0,
+          waitSeconds: sim.totalWaitSeconds,
+          waitDelta,
+          baselineRouteZoneNames: baseRoute,
+          simulatedRouteZoneNames: simRouteNames,
+          newFailure,
+        });
+      }
+    }
+
+    const maxArriveDelta = anyoneTrapped ? null : simMaxArrive - baselineMaxArrive;
+    const totalWaitDelta = anyoneTrapped ? null : simTotalWait - baselineTotalWait;
+    const key = [newFailures, maxArriveDelta, totalWaitDelta];
+    const hasImpact =
+      newFailures > 0 ||
+      affectedActors.length > 0 ||
+      (maxArriveDelta !== null && maxArriveDelta !== 0) ||
+      (totalWaitDelta !== null && totalWaitDelta !== 0);
+
+    const payload = {
+      edgeId: edge.id,
+      edgeName: `${zoneName(edge.a)} ↔ ${zoneName(edge.b)}`,
+      aZoneId: edge.a,
+      bZoneId: edge.b,
+      aZoneName: zoneName(edge.a),
+      bZoneName: zoneName(edge.b),
+      narrow: !!edge.narrow,
+      seconds: Number(edge.seconds),
+      riskKey: key,
+      newFailureCount: newFailures,
+      maxArriveDelta,
+      totalWaitDelta,
+      affectedActorCount: affectedActors.length,
+      affectedActors,
+    };
+    if (hasImpact) risks.push(payload);
+    else {
+      unaffectedCount += 1;
+      unaffectedEdgeIds.push(edge.id);
+    }
+  }
+
+  // 字典序降序（风险最高在前）；并列保持文档边顺序（排序稳定）
+  risks.sort((x, y) => (compareResilienceRisk(x.riskKey, y.riskKey) ? -1 : 1));
+
+  return {
+    moverCount: movers.length,
+    edgeClosureCount: usableEdges.length,
+    unaffectedEdgeClosureCount: unaffectedCount,
+    risks,
+    unaffectedEdgeIds,
+    unaffectedEdgeNames: unaffectedEdgeIds.map((id) => {
+      const e = usableEdges.find((ee) => ee.id === id);
+      return `${zoneName(e.a)} ↔ ${zoneName(e.b)}`;
+    }),
+  };
+}
+
+/**
  * 校验并规整文档。返回 { errors:[], warnings:[], doc }
  */
 function validateDocument(input) {
@@ -687,6 +903,7 @@ function analyze(input) {
       })),
     transitions: [],
     firstImpossible: null,
+    resilienceSummary: null, // 通道韧性总览（有需要移动演员的换场时生成）
   };
   if (errors.length) return base;
 
@@ -932,7 +1149,53 @@ function analyze(input) {
         improved: compareMetrics(opt.metrics, opt.currentMetrics) < 0,
       };
     }
+    // ---------- 通道韧性：逐条关闭一条原本可用的边重新调度 ----------
+    transition.resilience = analyzeTransitionResilience(doc, transition, blockedZoneIds);
+
     base.transitions.push(transition);
+  }
+
+  // 通道韧性总览：汇总各换场的关边模拟结果，风险按同一字典序取全剧最严峻者
+  const resilienceSummaries = base.transitions
+    .filter((t) => t.resilience)
+    .map((t) => ({
+      transitionIndex: t.index,
+      fromSceneId: t.fromSceneId,
+      toSceneId: t.toSceneId,
+      fromSceneName: t.fromSceneName,
+      toSceneName: t.toSceneName,
+      edgeClosureCount: t.resilience.edgeClosureCount,
+      riskCount: t.resilience.risks.length,
+      newFailureEdgeCount: t.resilience.risks.filter((x) => x.newFailureCount > 0).length,
+      maxNewFailureCount: t.resilience.risks.reduce((m, x) => Math.max(m, x.newFailureCount), 0),
+    }));
+  if (resilienceSummaries.length) {
+    let worst = null;
+    for (const t of base.transitions) {
+      if (!t.resilience) continue;
+      for (const risk of t.resilience.risks) {
+        if (!worst || compareResilienceRisk(risk.riskKey, worst.risk.riskKey)) {
+          worst = {
+            transitionIndex: t.index,
+            fromSceneName: t.fromSceneName,
+            toSceneName: t.toSceneName,
+            risk,
+          };
+        }
+      }
+    }
+    base.resilienceSummary = {
+      transitionCount: resilienceSummaries.length,
+      edgeClosureCount: resilienceSummaries.reduce((s, x) => s + x.edgeClosureCount, 0),
+      riskEdgeCount: resilienceSummaries.reduce((s, x) => s + x.riskCount, 0),
+      newFailureEdgeCount: resilienceSummaries.reduce((s, x) => s + x.newFailureEdgeCount, 0),
+      totalNewFailures: base.transitions.reduce(
+        (s, t) => s + (t.resilience ? t.resilience.risks.reduce((q, r) => q + r.newFailureCount, 0) : 0),
+        0,
+      ),
+      worst,
+      transitions: resilienceSummaries,
+    };
   }
 
   const firstBad = base.transitions.find((t) => !t.possible);
@@ -967,5 +1230,7 @@ module.exports = {
   compareMetrics,
   simulateTransitionOrder,
   optimizeTransitionOrder,
+  analyzeTransitionResilience,
+  compareResilienceRisk,
   EXACT_ORDER_LIMIT,
 };

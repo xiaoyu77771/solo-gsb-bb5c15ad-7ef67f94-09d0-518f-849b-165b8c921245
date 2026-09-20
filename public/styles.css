@@ -306,6 +306,63 @@ table.placements select { padding: 5px 6px; border: 1px solid var(--line); borde
 .opt-actor { padding-left: 0; padding-right: 0; }
 .opt-actor:last-child { border-bottom: none; }
 
+/* ---------- 通道韧性 ---------- */
+.resilience-filter {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 4px 0 12px;
+}
+.resilience-select-label { font-size: 13px; color: var(--ink); font-weight: 600; white-space: nowrap; }
+.resilience-select-label select {
+  padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; max-width: 340px;
+}
+.resilience-box {
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 16px; margin-bottom: 14px;
+}
+.resilience-head { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.resilience-head .meta { font-weight: 400; font-size: 12px; color: var(--ink-soft); }
+.rs-verdict { margin-top: 8px; font-size: 13px; border-radius: 8px; padding: 8px 12px; }
+.rs-verdict.ok { background: #ecf8f1; color: var(--ok); }
+.rs-verdict.warn { background: #fff8ec; color: #8a5a1d; }
+.rs-verdict.bad { background: #fdeeee; color: var(--danger); }
+.rs-transition { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 8px; }
+.rs-transition-head { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+.rs-transition-head .meta { font-weight: 400; color: var(--ink-soft); font-size: 12px; }
+.rs-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 6px 0;
+  background: #fbfcff;
+}
+.rs-card.has-fail { border-color: #e7b4b4; background: #fef8f8; }
+.rs-card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rs-edge { font-weight: 600; font-size: 13px; }
+.rs-edge.narrow { color: #b56f0a; }
+.rs-metrics { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+.rs-k { font-size: 12px; color: var(--ink-soft); background: #f1f3f7; border-radius: 10px; padding: 2px 10px; white-space: nowrap; }
+.rs-k b { color: var(--ink); font-size: 13px; }
+.rs-k.warn { background: #fff6e8; color: #8a5a1d; }
+.rs-k.warn b { color: #b56f0a; }
+.rs-k.bad { background: #fdeeee; color: var(--danger); }
+.rs-k.bad b { color: var(--danger); }
+.rs-actors { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.rs-actor {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; color: var(--ink-soft);
+  border-left: 2px solid #dbe3f3; padding-left: 10px;
+}
+.rs-actor.trapped { border-left-color: var(--danger); color: var(--danger); }
+.rs-actor.newfail { border-left-color: var(--warn); }
+.rs-outcome { font-weight: 700; white-space: nowrap; }
+.rs-detail { flex: 1; min-width: 200px; }
+.rs-newfail {
+  background: var(--danger); color: #fff; font-size: 11px; border-radius: 10px;
+  padding: 1px 8px; white-space: nowrap;
+}
+.rs-unaffected { margin-top: 4px; }
+.rs-unaffected summary { cursor: pointer; font-size: 12px; color: var(--primary); user-select: none; }
+
 .errors-box {
   background: #fdeeee; border: 1px solid #f2c3c3; border-radius: 10px; padding: 10px 16px; margin-bottom: 14px;
 }
